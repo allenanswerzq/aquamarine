@@ -93,7 +93,13 @@ namespace Aquamarine {
             Hyprutils::Math::Vector2D                        surfaceSize;
             Hyprutils::Math::Vector2D                        pendingSize;
             bool                                             announced = false;
+            // The host's preferred buffer scale. The output renders at the
+            // window's logical size (pendingSize) times this scale.
+            int32_t                                          scale = 1;
         } waylandState;
+
+        // The host scale if a buffer of this size divides by it, otherwise 1.
+        int32_t bufferScaleFor(const Hyprutils::Math::Vector2D& size) const;
 
         friend class CWaylandBackend;
         friend class CWaylandPointer;
@@ -110,7 +116,12 @@ namespace Aquamarine {
         Hyprutils::Memory::CWeakPointer<CWaylandBackend> backend;
 
       private:
-        const std::string name = "wl_keyboard";
+        const std::string     name = "wl_keyboard";
+
+        // Keys held down while the window has focus, released when it loses
+        // focus: the host sends their release to the next window instead.
+        std::vector<uint32_t> pressed;
+        uint32_t              lastTimeMs = 0, locked = 0, group = 0;
     };
 
     class CWaylandPointer : public IPointer {

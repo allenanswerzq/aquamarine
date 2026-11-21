@@ -4,7 +4,10 @@
 #include <ctime>
 #include <sys/timerfd.h>
 #include <cstring>
+#include <cerrno>
+#include <cstdlib>
 #include <unistd.h>
+#include <xf86drm.h>
 #include "Shared.hpp"
 
 using namespace Aquamarine;
@@ -131,11 +134,45 @@ std::vector<SP<SPollFD>> Aquamarine::CHeadlessBackend::pollFDs() {
 }
 
 int Aquamarine::CHeadlessBackend::drmFD() {
-    return -1;
+    return renderNode.isValid() ? renderNode.get() : -1;
 }
 
 int Aquamarine::CHeadlessBackend::drmRenderNodeFD() {
-    return -1;
+    return renderNode.isValid() ? renderNode.get() : -1;
+}
+
+bool Aquamarine::CHeadlessBackend::openRenderNode() {
+    if (renderNode.isValid())
+        return true;
+
+    // AQ_HEADLESS_RENDER_NODE picks the GPU; otherwise the first render node.
+    std::string path;
+    if (const char* env = getenv("AQ_HEADLESS_RENDER_NODE"); env && *env)
+        path = env;
+    else {
+        drmDevice* devices[64];
+        const int  count = drmGetDevices2(0, devices, 64);
+        for (int i = 0; i < count && path.empty(); ++i) {
+            if (devices[i]->available_nodes & (1 << DRM_NODE_RENDER))
+                path = devices[i]->nodes[DRM_NODE_RENDER];
+        }
+        if (count > 0)
+            drmFreeDevices(devices, count);
+    }
+
+    if (path.empty()) {
+        backend->log(AQ_LOG_ERROR, "headless: no render node found");
+        return false;
+    }
+
+    renderNode = Hyprutils::OS::CFileDescriptor{open(path.c_str(), O_RDWR | O_CLOEXEC)};
+    if (!renderNode.isValid()) {
+        backend->log(AQ_LOG_ERROR, std::format("headless: failed to open render node {}: {}", path, strerror(errno)));
+        return false;
+    }
+
+    backend->log(AQ_LOG_DEBUG, std::format("headless: rendering on {}", path));
+    return true;
 }
 
 bool Aquamarine::CHeadlessBackend::dispatchEvents() {

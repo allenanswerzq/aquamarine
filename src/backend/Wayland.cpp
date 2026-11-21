@@ -6,6 +6,7 @@
 #include "FormatUtils.hpp"
 #include <chrono>
 #include <cstring>
+#include <utility>
 #include <xf86drm.h>
 #include <gbm.h>
 #include <fcntl.h>
@@ -151,7 +152,10 @@ bool Aquamarine::CWaylandBackend::start() {
 
     dispatchEvents();
 
-    createOutput();
+    // AQ_WAYLAND_NO_INITIAL_OUTPUT=1 connects to the host without opening a
+    // window; outputs then come only from explicit createOutput() calls.
+    if (!envEnabled("AQ_WAYLAND_NO_INITIAL_OUTPUT"))
+        createOutput();
 
     return true;
 }
@@ -251,6 +255,11 @@ Aquamarine::CWaylandKeyboard::CWaylandKeyboard(SP<CCWlKeyboard> keyboard_, Hypru
     backend->backend->log(AQ_LOG_DEBUG, "New wayland keyboard wl_keyboard");
 
     keyboard->setKey([this](CCWlKeyboard* r, uint32_t serial, uint32_t timeMs, uint32_t key, wl_keyboard_key_state state) {
+        lastTimeMs = timeMs;
+        std::erase(pressed, key);
+        if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+            pressed.push_back(key);
+
         events.key.emit(SKeyEvent{
             .timeMs  = timeMs,
             .key     = key,
@@ -259,9 +268,31 @@ Aquamarine::CWaylandKeyboard::CWaylandKeyboard(SP<CCWlKeyboard> keyboard_, Hypru
     });
 
     keyboard->setModifiers([this](CCWlKeyboard* r, uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+        this->locked = locked;
+        this->group  = group;
         events.modifiers.emit(SModifiersEvent{
             .depressed = depressed,
             .latched   = latched,
+            .locked    = locked,
+            .group     = group,
+        });
+    });
+
+    // A shortcut on the host that moves focus away, like Super+Tab, leaves its
+    // modifier pressed here: release everything, or every later key here
+    // becomes a shortcut.
+    keyboard->setLeave([this](CCWlKeyboard* r, uint32_t serial, wl_proxy* surface) {
+        for (auto const& key : std::exchange(pressed, {})) {
+            events.key.emit(SKeyEvent{
+                .timeMs  = lastTimeMs,
+                .key     = key,
+                .pressed = false,
+            });
+        }
+
+        events.modifiers.emit(SModifiersEvent{
+            .depressed = 0,
+            .latched   = 0,
             .locked    = locked,
             .group     = group,
         });
@@ -522,6 +553,22 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
         return;
     }
 
+    // Render at the host's buffer scale, so the window is sharp and its
+    // logical size matches the host window on a HiDPI host.
+    waylandState.surface->setPreferredBufferScale([this](CCWlSurface* r, int32_t scale) {
+        if (scale < 1 || scale == waylandState.scale)
+            return;
+
+        backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: host buffer scale is {}", name, scale));
+        waylandState.scale = scale;
+        // Before the first configure there is no size yet; that configure applies the scale.
+        if (modes.empty())
+            return;
+
+        modes.front()->pixelSize = waylandState.pendingSize * scale;
+        applyConfigure();
+    });
+
     waylandState.xdgSurface = makeShared<CCXdgSurface>(backend->waylandState.xdg->sendGetXdgSurface(waylandState.surface->resource()));
 
     if (!waylandState.xdgSurface->resource()) {
@@ -536,7 +583,7 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
         // Retain the acknowledged size for consumers that attach their listeners later.
         if (modes.empty())
             modes.emplace_back(makeShared<SOutputMode>(SOutputMode{.refreshRate = 60000, .preferred = true}));
-        modes.front()->pixelSize = waylandState.pendingSize;
+        modes.front()->pixelSize = waylandState.pendingSize * waylandState.scale;
         applyConfigure();
     });
 
@@ -707,6 +754,12 @@ bool Aquamarine::CWaylandOutput::commit() {
 
     wlBuffer->pendingRelease = true;
 
+    // A buffer from before a scale change may not divide by the new scale;
+    // show that one at scale 1 rather than send an invalid size.
+    const auto    BUFSIZE = STATE.buffer->size;
+    const int32_t SCALE   = bufferScaleFor(BUFSIZE);
+
+    waylandState.surface->sendSetBufferScale(SCALE);
     waylandState.surface->sendAttach(wlBuffer->waylandState.buffer.get(), 0, 0);
     waylandState.surface->sendDamageBuffer(0, 0, INT32_MAX, INT32_MAX);
 
@@ -726,7 +779,7 @@ bool Aquamarine::CWaylandOutput::commit() {
     }
 
     waylandState.surface->sendCommit();
-    waylandState.surfaceSize = STATE.buffer->size;
+    waylandState.surfaceSize = BUFSIZE / SCALE;
 
     // Flush immediately: commit() runs from the consumer's render path, outside
     // dispatchEvents() (which flushes only at its top). Without this the buffer commit and
@@ -851,7 +904,11 @@ bool Aquamarine::CWaylandOutput::setCursor(Hyprutils::Memory::CSharedPointer<IBu
         return false;
     }
 
-    cursorState.cursorSurface->sendSetBufferScale(1);
+    // The consumer renders the cursor at the output's scale, like the output.
+    const int32_t SCALE = bufferScaleFor(buffer->size);
+    cursorState.hotspot = hotspot / SCALE;
+
+    cursorState.cursorSurface->sendSetBufferScale(SCALE);
     cursorState.cursorSurface->sendSetBufferTransform(WL_OUTPUT_TRANSFORM_NORMAL);
     cursorState.cursorSurface->sendAttach(cursorState.cursorWlBuffer.get(), 0, 0);
     cursorState.cursorSurface->sendDamage(0, 0, INT32_MAX, INT32_MAX);
@@ -879,6 +936,13 @@ void Aquamarine::CWaylandOutput::onEnter(SP<CCWlPointer> pointer, uint32_t seria
 
 Hyprutils::Math::Vector2D Aquamarine::CWaylandOutput::cursorPlaneSize() {
     return {-1, -1}; // no limit
+}
+
+int32_t Aquamarine::CWaylandOutput::bufferScaleFor(const Hyprutils::Math::Vector2D& size) const {
+    const int32_t SCALE = waylandState.scale;
+    if ((int64_t)size.x % SCALE == 0 && (int64_t)size.y % SCALE == 0)
+        return SCALE;
+    return 1;
 }
 
 void Aquamarine::CWaylandOutput::scheduleFrame(const scheduleFrameReason reason) {

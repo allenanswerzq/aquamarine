@@ -66,6 +66,11 @@ namespace Aquamarine {
 
         size_t                                                          outputIDCounter = 0;
 
+        // A GPU render node for when no other backend provides a DRM device,
+        // so a headless-only instance can still allocate buffers and render.
+        Hyprutils::OS::CFileDescriptor renderNode;
+        bool                           openRenderNode();
+
         class CTimer {
           public:
             std::chrono::steady_clock::time_point when;

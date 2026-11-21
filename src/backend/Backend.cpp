@@ -169,6 +169,15 @@ bool Aquamarine::CBackend::start() {
         session.reset();
     }
 
+    // Headless-only: no backend owns a DRM device, so the headless backend
+    // opens a render node for the allocator and the renderer.
+    if (std::ranges::none_of(implementations, [](const auto& i) { return i->drmFD() >= 0; })) {
+        for (auto const& b : implementations) {
+            if (b->type() == AQ_BACKEND_HEADLESS)
+                ((CHeadlessBackend*)b.get())->openRenderNode();
+        }
+    }
+
     // TODO: obviously change this when (if) we add different allocators.
     for (auto const& b : implementations) {
         if (b->drmFD() >= 0) {
